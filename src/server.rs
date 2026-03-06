@@ -21,7 +21,7 @@ use crate::{
     tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
 };
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -760,6 +760,7 @@ pub fn build_app(
         .merge(admin_routes)
         .merge(worker_routes)
         // Request body size limiting
+        .layer(DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
         ))
