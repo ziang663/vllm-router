@@ -237,6 +237,13 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 return await handle_stream_request(request)
             return await handle_text_request(request)
 
+    @app.post("/v1/responses")
+    async def responses(request: Request):
+        async with track_inflight():
+            if args.stream:
+                return await handle_stream_request(request)
+            return await handle_text_request(request)
+
     return app
 
 

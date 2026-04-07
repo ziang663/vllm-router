@@ -36,3 +36,22 @@ def test_router_api_key_enforcement(router_manager, mock_workers):
         headers={"Authorization": "Bearer correct_api_key"},
     )
     assert r.status_code == 200
+
+
+@pytest.mark.integration
+def test_router_responses_forwards_authorization_header(router_manager, mock_workers):
+    _, urls, _ = mock_workers(
+        n=1, args=["--require-api-key", "--api-key", "correct_api_key"]
+    )
+    rh = router_manager.start_router(
+        worker_urls=urls,
+        policy="round_robin",
+        extra={},
+    )
+
+    r = requests.post(
+        f"{rh.url}/v1/responses",
+        json={"model": "test-model", "input": "hello", "stream": False},
+        headers={"Authorization": "Bearer correct_api_key"},
+    )
+    assert r.status_code == 200

@@ -1713,6 +1713,22 @@ impl RouterTrait for Router {
             request_builder = request_builder.json(&body);
         }
 
+        // Copy client headers through the transparent proxy path as well.
+        // This keeps auth/session routing behavior consistent with typed routes
+        // like /v1/chat/completions and is required for /v1/responses.
+        if let Some(headers) = headers {
+            for (name, value) in headers {
+                if *name != CONTENT_TYPE
+                    && *name != CONTENT_LENGTH
+                    && !header_utils::TRACE_HEADER_NAMES
+                        .iter()
+                        .any(|&th| name.as_str().eq_ignore_ascii_case(th))
+                {
+                    request_builder = request_builder.header(name, value);
+                }
+            }
+        }
+
         // Add authorization if configured
         if let Some(ref key) = self.api_key {
             request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
