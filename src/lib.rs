@@ -25,6 +25,7 @@ use crate::metrics::PrometheusConfig;
 pub enum PolicyType {
     Random,
     RoundRobin,
+    SicoSticky,
     CacheAware,
     PowerOfTwo,
     ConsistentHash,
@@ -129,6 +130,7 @@ impl Router {
             match policy {
                 PolicyType::Random => ConfigPolicyConfig::Random,
                 PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
+                PolicyType::SicoSticky => ConfigPolicyConfig::SicoSticky,
                 PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
                     cache_threshold: self.cache_threshold,
                     balance_abs_threshold: self.balance_abs_threshold,

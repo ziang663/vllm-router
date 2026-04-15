@@ -6,7 +6,7 @@
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
+    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy, SicoStickyPolicy,
 };
 use crate::config::types::PolicyConfig;
 use std::collections::HashMap;
@@ -170,6 +170,7 @@ impl PolicyRegistry {
         match policy_type {
             "round_robin" => Arc::new(RoundRobinPolicy::new()),
             "random" => Arc::new(RandomPolicy::new()),
+            "sico_sticky" | "sico" => Arc::new(SicoStickyPolicy::new()),
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             _ => {
@@ -184,6 +185,7 @@ impl PolicyRegistry {
         match config {
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
+            PolicyConfig::SicoSticky => Arc::new(SicoStickyPolicy::new()),
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold,

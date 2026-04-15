@@ -5,7 +5,7 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{BackendObservedLoad, LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
@@ -48,6 +48,93 @@ pub struct Router {
 }
 
 impl Router {
+    fn policy_uses_inflight_load(policy_name: &str) -> bool {
+        matches!(policy_name, "cache_aware" | "sico_sticky")
+    }
+
+    fn policy_uses_backend_metrics(policy_name: &str) -> bool {
+        policy_name == "sico_sticky"
+    }
+
+    pub(crate) fn parse_backend_observed_load(
+        metrics_scrape: &str,
+        scrape_token: i64,
+    ) -> Option<BackendObservedLoad> {
+        let mut waiting = None;
+        let mut running = None;
+
+        for line in metrics_scrape.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let Some((metric_name, value_str)) = line.rsplit_once(' ') else {
+                continue;
+            };
+            let metric_name = metric_name.split('{').next().unwrap_or(metric_name);
+            let Some(value) = value_str.parse::<f64>().ok().map(|v| v as i64) else {
+                continue;
+            };
+
+            match metric_name {
+                "vllm:num_requests_waiting" | "sglang:num_queue_reqs" => waiting = Some(value),
+                "vllm:num_requests_running" | "sglang:num_running_reqs" => running = Some(value),
+                _ => {}
+            }
+        }
+
+        match (waiting, running) {
+            (Some(waiting), Some(running)) => Some(BackendObservedLoad {
+                waiting,
+                running,
+                scrape_token,
+            }),
+            _ => None,
+        }
+    }
+
+    async fn get_worker_backend_observation_static(
+        client: &reqwest::Client,
+        worker_url: &str,
+        scrape_token: i64,
+    ) -> Option<BackendObservedLoad> {
+        let worker_url = if worker_url.contains("@") {
+            let (worker_url_prefix, _dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
+                Ok(tup) => tup,
+                Err(e) => {
+                    debug!("Failed to extract dp_rank for metrics scrape: {}", e);
+                    return None;
+                }
+            };
+            worker_url_prefix
+        } else {
+            worker_url
+        };
+
+        match client.get(format!("{}/metrics", worker_url)).send().await {
+            Ok(res) if res.status().is_success() => match res.text().await {
+                Ok(text) => Self::parse_backend_observed_load(&text, scrape_token),
+                Err(e) => {
+                    debug!("Failed to read metrics scrape from {}: {}", worker_url, e);
+                    None
+                }
+            },
+            Ok(res) => {
+                debug!(
+                    "Worker {} returned non-success metrics status: {}",
+                    worker_url,
+                    res.status()
+                );
+                None
+            }
+            Err(e) => {
+                debug!("Failed to scrape metrics from {}: {}", worker_url, e);
+                None
+            }
+        }
+    }
+
     /// Create a new router with injected policy and client
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -157,6 +244,21 @@ impl Router {
                 Self::monitor_worker_loads(
                     monitor_urls,
                     tx,
+                    monitor_interval,
+                    policy_clone,
+                    client_clone,
+                )
+                .await;
+            })))
+        } else if Self::policy_uses_backend_metrics(default_policy.name()) {
+            let monitor_urls = worker_urls.clone();
+            let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
+            let policy_clone = default_policy.clone();
+            let client_clone = ctx.client.clone();
+
+            Some(Arc::new(tokio::spawn(async move {
+                Self::monitor_worker_backend_observations(
+                    monitor_urls,
                     monitor_interval,
                     policy_clone,
                     client_clone,
@@ -571,7 +673,7 @@ impl Router {
                     None => self.policy_registry.get_default_policy(),
                 };
 
-                let load_incremented = if policy.name() == "cache_aware" {
+                let load_incremented = if Self::policy_uses_inflight_load(policy.name()) {
                     worker.increment_load();
                     RouterMetrics::set_running_requests(worker.url(), worker.load());
                     true
@@ -1312,6 +1414,34 @@ impl Router {
         }
     }
 
+    async fn monitor_worker_backend_observations(
+        worker_urls: Vec<String>,
+        interval_secs: u64,
+        policy: Arc<dyn LoadBalancingPolicy>,
+        client: Client,
+    ) {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        let mut scrape_token: i64 = 0;
+
+        loop {
+            interval.tick().await;
+            scrape_token = scrape_token.saturating_add(1);
+
+            let mut observations = HashMap::new();
+            for url in &worker_urls {
+                if let Some(observed) =
+                    Self::get_worker_backend_observation_static(&client, url, scrape_token).await
+                {
+                    observations.insert(url.clone(), observed);
+                }
+            }
+
+            if !observations.is_empty() {
+                policy.update_backend_observations(&observations);
+            }
+        }
+    }
+
     // Static version of get_worker_load for use in monitoring task
     async fn get_worker_load_static(client: &reqwest::Client, worker_url: &str) -> Option<isize> {
         let worker_url = if worker_url.contains("@") {
@@ -1917,6 +2047,36 @@ mod tests {
         let result = Router::headers_to_request_headers(Some(&header_map));
         assert!(result.is_some());
         assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_backend_observed_load_supports_vllm_metrics() {
+        let scrape = r#"
+# HELP vllm:num_requests_running Number of running requests.
+vllm:num_requests_running 7
+# HELP vllm:num_requests_waiting Number of waiting requests.
+vllm:num_requests_waiting 13
+"#;
+
+        let observed = Router::parse_backend_observed_load(scrape, 42).unwrap();
+        assert_eq!(observed.running, 7);
+        assert_eq!(observed.waiting, 13);
+        assert_eq!(observed.scrape_token, 42);
+    }
+
+    #[test]
+    fn test_parse_backend_observed_load_supports_sglang_metrics() {
+        let scrape = r#"
+# HELP sglang:num_running_reqs The number of running requests
+sglang:num_running_reqs{model_name="foo"} 5
+# HELP sglang:num_queue_reqs The number of requests in the waiting queue
+sglang:num_queue_reqs{model_name="foo"} 11
+"#;
+
+        let observed = Router::parse_backend_observed_load(scrape, 9).unwrap();
+        assert_eq!(observed.running, 5);
+        assert_eq!(observed.waiting, 11);
+        assert_eq!(observed.scrape_token, 9);
     }
 
     #[test]

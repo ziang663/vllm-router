@@ -229,6 +229,9 @@ pub enum PolicyConfig {
     #[serde(rename = "round_robin")]
     RoundRobin,
 
+    #[serde(rename = "sico_sticky")]
+    SicoSticky,
+
     #[serde(rename = "cache_aware")]
     CacheAware {
         /// Minimum prefix match ratio to use cache-based routing
@@ -261,6 +264,7 @@ impl PolicyConfig {
         match self {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
+            PolicyConfig::SicoSticky => "sico_sticky",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",

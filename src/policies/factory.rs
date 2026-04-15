@@ -2,7 +2,7 @@
 
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
+    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy, SicoStickyPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ impl PolicyFactory {
         match config {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
+            PolicyConfig::SicoSticky => Arc::new(SicoStickyPolicy::new()),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::CacheAware {
                 cache_threshold,
@@ -46,6 +47,7 @@ impl PolicyFactory {
         match name.to_lowercase().as_str() {
             "random" => Some(Arc::new(RandomPolicy::new())),
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
+            "sico_sticky" | "sicosticky" | "sico" => Some(Arc::new(SicoStickyPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "consistent_hash" | "consistenthash" => Some(Arc::new(ConsistentHashPolicy::new())),
@@ -67,6 +69,10 @@ mod tests {
         // Test RoundRobin
         let policy = PolicyFactory::create_from_config(&PolicyConfig::RoundRobin);
         assert_eq!(policy.name(), "round_robin");
+
+        // Test SicoSticky
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::SicoSticky);
+        assert_eq!(policy.name(), "sico_sticky");
 
         // Test PowerOfTwo
         let policy = PolicyFactory::create_from_config(&PolicyConfig::PowerOfTwo {
@@ -96,6 +102,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("RANDOM").is_some());
         assert!(PolicyFactory::create_by_name("round_robin").is_some());
         assert!(PolicyFactory::create_by_name("RoundRobin").is_some());
+        assert!(PolicyFactory::create_by_name("sico_sticky").is_some());
+        assert!(PolicyFactory::create_by_name("SicoSticky").is_some());
         assert!(PolicyFactory::create_by_name("power_of_two").is_some());
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());

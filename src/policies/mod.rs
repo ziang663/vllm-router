@@ -15,6 +15,7 @@ mod power_of_two;
 mod random;
 mod registry;
 mod round_robin;
+mod sico_sticky;
 
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hash::ConsistentHashPolicy;
@@ -23,10 +24,19 @@ pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+pub use sico_sticky::SicoStickyPolicy;
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value
 pub type RequestHeaders = HashMap<String, String>;
+
+/// Backend-observed per-worker scheduler state derived from metrics scrapes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BackendObservedLoad {
+    pub waiting: i64,
+    pub running: i64,
+    pub scrape_token: i64,
+}
 
 /// Core trait for load balancing policies
 ///
@@ -111,6 +121,14 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// This is called periodically with current load information for load-aware policies.
     fn update_loads(&self, _loads: &std::collections::HashMap<String, isize>) {
         // Default: no-op for policies that don't use load information
+    }
+
+    /// Update backend-observed scheduler state from metrics scrapes.
+    fn update_backend_observations(
+        &self,
+        _observations: &std::collections::HashMap<String, BackendObservedLoad>,
+    ) {
+        // Default: no-op for policies that don't use backend scheduler state
     }
 
     /// Reset any internal state

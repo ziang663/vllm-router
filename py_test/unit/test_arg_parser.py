@@ -410,6 +410,7 @@ class TestPolicyFromStr:
 
         assert policy_from_str("random") == PolicyType.Random
         assert policy_from_str("round_robin") == PolicyType.RoundRobin
+        assert policy_from_str("sico_sticky") == PolicyType.SicoSticky
         assert policy_from_str("cache_aware") == PolicyType.CacheAware
         assert policy_from_str("power_of_two") == PolicyType.PowerOfTwo
         assert policy_from_str("consistent_hash") == PolicyType.ConsistentHash

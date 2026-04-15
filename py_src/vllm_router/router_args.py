@@ -137,6 +137,7 @@ class RouterArgs:
             choices=[
                 "random",
                 "round_robin",
+                "sico_sticky",
                 "cache_aware",
                 "power_of_two",
                 "consistent_hash",
@@ -150,6 +151,7 @@ class RouterArgs:
             choices=[
                 "random",
                 "round_robin",
+                "sico_sticky",
                 "cache_aware",
                 "power_of_two",
                 "consistent_hash",
@@ -163,6 +165,7 @@ class RouterArgs:
             choices=[
                 "random",
                 "round_robin",
+                "sico_sticky",
                 "cache_aware",
                 "power_of_two",
                 "consistent_hash",
