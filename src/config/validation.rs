@@ -177,7 +177,7 @@ impl ConfigValidator {
     /// Validate policy configuration
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin => {
+            PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::SicoSticky => {
                 // No specific validation needed
             }
             PolicyConfig::CacheAware {
@@ -728,6 +728,22 @@ mod tests {
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
             },
+        );
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_sico_sticky_with_regular_mode() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec![
+                    "http://worker1:8000".to_string(),
+                    "http://worker2:8000".to_string(),
+                ],
+            },
+            PolicyConfig::SicoSticky,
         );
 
         let result = ConfigValidator::validate(&config);
