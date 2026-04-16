@@ -1921,6 +1921,11 @@ pub struct GenerateRequest {
     /// Request ID for tracking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rid: Option<String>,
+
+    /// Preserve backend-specific extension fields when routing typed /generate
+    /// requests so the router does not drop non-vLLM payload keys.
+    #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
 }
 
 impl GenerationRequest for GenerateRequest {
@@ -3100,6 +3105,33 @@ mod tests {
         };
         // Only top-level string elements are extracted
         assert_eq!(req.extract_text_for_routing(), "a");
+    }
+
+    #[test]
+    fn test_generate_request_preserves_unknown_fields() {
+        let raw = serde_json::json!({
+            "target_text": "tts payload",
+            "ref_audio_id": "voice-1",
+            "task_id": "job-123",
+            "stream": false
+        });
+
+        let req: GenerateRequest = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(
+            req.extra.get("target_text"),
+            Some(&serde_json::Value::String("tts payload".to_string()))
+        );
+        assert_eq!(
+            req.extra.get("ref_audio_id"),
+            Some(&serde_json::Value::String("voice-1".to_string()))
+        );
+        assert_eq!(
+            req.extra.get("task_id"),
+            Some(&serde_json::Value::String("job-123".to_string()))
+        );
+
+        let roundtrip = serde_json::to_value(&req).unwrap();
+        assert_eq!(roundtrip, raw);
     }
 
     // ==================================================================
