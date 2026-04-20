@@ -5,8 +5,8 @@
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy, SicoStickyPolicy,
+    CacheAwareConfig, CacheAwareNoQueuePolicy, CacheAwarePolicy, ConsistentHashPolicy,
+    LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy, SicoStickyPolicy,
 };
 use crate::config::types::PolicyConfig;
 use std::collections::HashMap;
@@ -172,6 +172,7 @@ impl PolicyRegistry {
             "random" => Arc::new(RandomPolicy::new()),
             "sico_sticky" | "sico" => Arc::new(SicoStickyPolicy::new()),
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
+            "cache_aware_no_queue" => Arc::new(CacheAwareNoQueuePolicy::new()),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             _ => {
                 warn!("Unknown policy type '{}', using default", policy_type);
@@ -201,6 +202,22 @@ impl PolicyRegistry {
                     max_tree_size: *max_tree_size,
                 };
                 Arc::new(CacheAwarePolicy::with_config(cache_config))
+            }
+            PolicyConfig::CacheAwareNoQueue {
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                let cache_config = CacheAwareConfig {
+                    cache_threshold: *cache_threshold,
+                    balance_abs_threshold: *balance_abs_threshold,
+                    balance_rel_threshold: *balance_rel_threshold,
+                    eviction_interval_secs: *eviction_interval_secs,
+                    max_tree_size: *max_tree_size,
+                };
+                Arc::new(CacheAwareNoQueuePolicy::with_config(cache_config))
             }
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),

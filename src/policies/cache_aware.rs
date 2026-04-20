@@ -574,4 +574,5 @@ mod tests {
         let idx = policy.select_worker(&workers, Some("test1")).unwrap();
         assert_eq!(idx, 1);
     }
+
 }

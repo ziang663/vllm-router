@@ -1,8 +1,8 @@
 //! Factory for creating load balancing policies
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy, SicoStickyPolicy,
+    CacheAwareConfig, CacheAwareNoQueuePolicy, CacheAwarePolicy, ConsistentHashPolicy,
+    LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy, SicoStickyPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -34,6 +34,22 @@ impl PolicyFactory {
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
+            PolicyConfig::CacheAwareNoQueue {
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                let config = CacheAwareConfig {
+                    cache_threshold: *cache_threshold,
+                    balance_abs_threshold: *balance_abs_threshold,
+                    balance_rel_threshold: *balance_rel_threshold,
+                    eviction_interval_secs: *eviction_interval_secs,
+                    max_tree_size: *max_tree_size,
+                };
+                Arc::new(CacheAwareNoQueuePolicy::with_config(config))
+            }
             PolicyConfig::ConsistentHash { virtual_nodes: _ } => {
                 // Note: virtual_nodes parameter is available but not currently used
                 // The consistent hash policy uses a hardcoded value for now
@@ -50,6 +66,9 @@ impl PolicyFactory {
             "sico_sticky" | "sicosticky" | "sico" => Some(Arc::new(SicoStickyPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
+            "cache_aware_no_queue" | "cacheawarenoqueue" => {
+                Some(Arc::new(CacheAwareNoQueuePolicy::new()))
+            }
             "consistent_hash" | "consistenthash" => Some(Arc::new(ConsistentHashPolicy::new())),
             _ => None,
         }
@@ -90,6 +109,15 @@ mod tests {
         });
         assert_eq!(policy.name(), "cache_aware");
 
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::CacheAwareNoQueue {
+            cache_threshold: 0.7,
+            balance_abs_threshold: 10,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 30,
+            max_tree_size: 1000,
+        });
+        assert_eq!(policy.name(), "cache_aware_no_queue");
+
         // Test ConsistentHash
         let policy =
             PolicyFactory::create_from_config(&PolicyConfig::ConsistentHash { virtual_nodes: 160 });
@@ -108,6 +136,7 @@ mod tests {
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
+        assert!(PolicyFactory::create_by_name("cache_aware_no_queue").is_some());
         assert!(PolicyFactory::create_by_name("consistent_hash").is_some());
         assert!(PolicyFactory::create_by_name("ConsistentHash").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());

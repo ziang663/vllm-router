@@ -246,6 +246,20 @@ pub enum PolicyConfig {
         max_tree_size: usize,
     },
 
+    #[serde(rename = "cache_aware_no_queue")]
+    CacheAwareNoQueue {
+        /// Minimum prefix match ratio to use cache-based routing
+        cache_threshold: f32,
+        /// Absolute load difference threshold for load balancing
+        balance_abs_threshold: usize,
+        /// Relative load ratio threshold for load balancing
+        balance_rel_threshold: f32,
+        /// Interval between cache eviction cycles (seconds)
+        eviction_interval_secs: u64,
+        /// Maximum cache tree size per tenant
+        max_tree_size: usize,
+    },
+
     #[serde(rename = "power_of_two")]
     PowerOfTwo {
         /// Interval for load monitoring (seconds)
@@ -266,6 +280,7 @@ impl PolicyConfig {
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::SicoSticky => "sico_sticky",
             PolicyConfig::CacheAware { .. } => "cache_aware",
+            PolicyConfig::CacheAwareNoQueue { .. } => "cache_aware_no_queue",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
         }

@@ -11,6 +11,7 @@ The vLLM Router supports multiple load balancing policies for distributing reque
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
+| `cache_aware_no_queue` | Cache-aware but only on idle workers | Yes (cache-based) | Yes |
 
 ---
 

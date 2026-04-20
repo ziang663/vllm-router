@@ -116,12 +116,7 @@ impl GrpcRouter {
         }
 
         // Initialize policy with workers if needed
-        if let Some(cache_aware) = policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_aware.init_workers(&workers);
-        }
+        crate::policies::sync_stateful_policy_workers(&policy, &workers);
 
         let workers = Arc::new(RwLock::new(workers));
         let health_checker = crate::core::start_health_checker(

@@ -159,19 +159,8 @@ impl GrpcPDRouter {
             .collect();
 
         // Initialize policies with workers if needed
-        if let Some(cache_aware) = prefill_policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_aware.init_workers(&prefill_workers);
-        }
-
-        if let Some(cache_aware) = decode_policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_aware.init_workers(&decode_workers);
-        }
+        crate::policies::sync_stateful_policy_workers(&prefill_policy, &prefill_workers);
+        crate::policies::sync_stateful_policy_workers(&decode_policy, &decode_workers);
 
         let prefill_workers = Arc::new(RwLock::new(prefill_workers));
         let decode_workers = Arc::new(RwLock::new(decode_workers));

@@ -9,6 +9,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 mod cache_aware;
+mod cache_aware_no_queue;
 mod consistent_hash;
 mod factory;
 mod power_of_two;
@@ -18,6 +19,7 @@ mod round_robin;
 mod sico_sticky;
 
 pub use cache_aware::CacheAwarePolicy;
+pub use cache_aware_no_queue::CacheAwareNoQueuePolicy;
 pub use consistent_hash::ConsistentHashPolicy;
 pub use factory::PolicyFactory;
 pub use power_of_two::PowerOfTwoPolicy;
@@ -196,6 +198,28 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
         "default"
     } else {
         model_id
+    }
+}
+
+pub fn sync_stateful_policy_workers(
+    policy: &Arc<dyn LoadBalancingPolicy>,
+    workers: &[Arc<dyn Worker>],
+) {
+    if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+        cache_aware.init_workers(workers);
+    }
+    if let Some(cache_aware_no_queue) = policy.as_any().downcast_ref::<CacheAwareNoQueuePolicy>() {
+        cache_aware_no_queue.init_workers(workers);
+    }
+}
+
+pub fn remove_worker_from_stateful_policy(policy: &Arc<dyn LoadBalancingPolicy>, url: &str) {
+    if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+        cache_aware.remove_worker_by_url(url);
+    }
+    if let Some(cache_aware_no_queue) = policy.as_any().downcast_ref::<CacheAwareNoQueuePolicy>()
+    {
+        cache_aware_no_queue.remove_worker_by_url(url);
     }
 }
 

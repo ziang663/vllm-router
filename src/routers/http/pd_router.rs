@@ -10,7 +10,10 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{
+    remove_worker_from_stateful_policy, sync_stateful_policy_workers, LoadBalancingPolicy,
+    PolicyRegistry,
+};
 use crate::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, RerankRequest,
     ResponsesRequest, StringOrArray, UserMessageContent,
@@ -289,15 +292,8 @@ impl PDRouter {
         let policy = self.policy_registry.on_worker_added(model_id, None);
 
         // If this is a cache-aware policy, update it with all workers for this model
-        if policy.name() == "cache_aware" {
-            if let Some(cache_aware) = policy
-                .as_any()
-                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-            {
-                let model_workers = self.worker_registry.get_by_model_fast(model_id);
-                cache_aware.init_workers(&model_workers);
-            }
-        }
+        let model_workers = self.worker_registry.get_by_model_fast(model_id);
+        sync_stateful_policy_workers(&policy, &model_workers);
 
         info!("Added prefill server: {}", url);
         Ok(format!("Successfully added prefill server: {}", url))
@@ -329,15 +325,8 @@ impl PDRouter {
         let policy = self.policy_registry.on_worker_added(model_id, None);
 
         // If this is a cache-aware policy, update it with all workers for this model
-        if policy.name() == "cache_aware" {
-            if let Some(cache_aware) = policy
-                .as_any()
-                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-            {
-                let model_workers = self.worker_registry.get_by_model_fast(model_id);
-                cache_aware.init_workers(&model_workers);
-            }
-        }
+        let model_workers = self.worker_registry.get_by_model_fast(model_id);
+        sync_stateful_policy_workers(&policy, &model_workers);
 
         info!("Added decode server: {}", url);
         Ok(format!("Successfully added decode server: {}", url))
@@ -363,14 +352,7 @@ impl PDRouter {
 
             // Get the policy for this model to update cache-aware if needed
             if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if policy.name() == "cache_aware" {
-                    if let Some(cache_aware) = policy
-                        .as_any()
-                        .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                    {
-                        cache_aware.remove_worker_by_url(url);
-                    }
-                }
+                remove_worker_from_stateful_policy(&policy, url);
             }
         }
 
@@ -404,14 +386,7 @@ impl PDRouter {
 
             // Get the policy for this model to update cache-aware if needed
             if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if policy.name() == "cache_aware" {
-                    if let Some(cache_aware) = policy
-                        .as_any()
-                        .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                    {
-                        cache_aware.remove_worker_by_url(url);
-                    }
-                }
+                remove_worker_from_stateful_policy(&policy, url);
             }
         }
 

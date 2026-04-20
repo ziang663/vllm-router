@@ -123,7 +123,7 @@ struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "sico_sticky", "cache_aware", "power_of_two", "consistent_hash"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "sico_sticky", "cache_aware", "cache_aware_no_queue", "power_of_two", "consistent_hash"])]
     policy: String,
 
     /// Enable PD (Prefill-Decode) disaggregated mode
@@ -144,11 +144,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "sico_sticky", "cache_aware", "power_of_two", "consistent_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "sico_sticky", "cache_aware", "cache_aware_no_queue", "power_of_two", "consistent_hash"])]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "sico_sticky", "cache_aware", "power_of_two", "consistent_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "sico_sticky", "cache_aware", "cache_aware_no_queue", "power_of_two", "consistent_hash"])]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
@@ -398,6 +398,13 @@ impl CliArgs {
             "round_robin" => PolicyConfig::RoundRobin,
             "sico_sticky" => PolicyConfig::SicoSticky,
             "cache_aware" => PolicyConfig::CacheAware {
+                cache_threshold: self.cache_threshold,
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
+                eviction_interval_secs: self.eviction_interval,
+                max_tree_size: self.max_tree_size,
+            },
+            "cache_aware_no_queue" => PolicyConfig::CacheAwareNoQueue {
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,
                 balance_rel_threshold: self.balance_rel_threshold,

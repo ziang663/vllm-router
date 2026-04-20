@@ -14,6 +14,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "round_robin": PolicyType.RoundRobin,
         "sico_sticky": PolicyType.SicoSticky,
         "cache_aware": PolicyType.CacheAware,
+        "cache_aware_no_queue": PolicyType.CacheAwareNoQueue,
         "power_of_two": PolicyType.PowerOfTwo,
         "consistent_hash": PolicyType.ConsistentHash,
     }
