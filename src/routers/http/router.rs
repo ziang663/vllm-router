@@ -21,7 +21,8 @@ use axum::{
     body::Body,
     extract::Request,
     http::{
-        header::CONTENT_LENGTH, header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode,
+        header::CONTENT_LENGTH, header::CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, Method,
+        StatusCode,
     },
     response::{IntoResponse, Response},
     Json,
@@ -33,6 +34,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
+
+const NO_RETRY_HEADER: &str = "x-router-no-retry";
+const NO_RETRY_REASON_NO_WORKER: &str = "no_available_workers";
 
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
@@ -60,6 +64,26 @@ impl Router {
 
     fn policy_uses_backend_metrics(policy_name: &str) -> bool {
         matches!(policy_name, "sico_sticky" | "cache_aware_no_queue")
+    }
+
+    fn policy_fails_fast_when_no_worker(policy_name: &str) -> bool {
+        policy_name == "cache_aware_no_queue"
+    }
+
+    fn mark_response_no_retry(mut response: Response, reason: &'static str) -> Response {
+        response.headers_mut().insert(
+            HeaderName::from_static(NO_RETRY_HEADER),
+            HeaderValue::from_static(reason),
+        );
+        response
+    }
+
+    fn response_is_marked_no_retry(response: &Response) -> bool {
+        response
+            .headers()
+            .get(NO_RETRY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .is_some()
     }
 
     pub(crate) fn parse_backend_observed_load(
@@ -653,25 +677,29 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
-                    Some(w) => w,
-                    None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No available workers (all circuits open or unhealthy)",
-                        )
-                            .into_response();
-                    }
-                };
-
-                // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
                 let policy = match model_id {
                     Some(model) => self.policy_registry.get_policy_or_default(model),
                     None => self.policy_registry.get_default_policy(),
                 };
 
+                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
+                    Some(w) => w,
+                    None => {
+                        RouterMetrics::record_request_error(route, "no_available_workers");
+                        let response: Response = (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "No available workers (all circuits open or unhealthy)",
+                        )
+                            .into_response();
+                        return if Self::policy_fails_fast_when_no_worker(policy.name()) {
+                            Self::mark_response_no_retry(response, NO_RETRY_REASON_NO_WORKER)
+                        } else {
+                            response
+                        };
+                    }
+                };
+
+                // Optional load tracking for cache-aware policy
                 let load_incremented = if Self::policy_uses_inflight_load(policy.name()) {
                     worker.increment_load();
                     RouterMetrics::set_running_requests(worker.url(), worker.load());
@@ -718,7 +746,9 @@ impl Router {
                 response
             },
             // should_retry predicate
-            |res, _attempt| is_retryable_status(res.status()),
+            |res, _attempt| {
+                !Self::response_is_marked_no_retry(res) && is_retryable_status(res.status())
+            },
             // on_backoff hook
             |delay, attempt| {
                 RouterMetrics::record_retry(route);
