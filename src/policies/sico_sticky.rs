@@ -14,6 +14,7 @@ use super::{
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,7 @@ struct StickyState {
 pub struct SicoStickyPolicy {
     state: Mutex<StickyState>,
     cached_loads: RwLock<HashMap<String, isize>>,
+    cached_load_generation: AtomicI64,
     observed: RwLock<HashMap<String, BackendObservedLoad>>,
 }
 
@@ -72,14 +74,8 @@ impl SicoStickyPolicy {
         {
             return Some(format!("session:{}", session_id));
         }
-        if let Some(user) = ConsistentHeaderKeys::extract_field_value(text, "user") {
-            return Some(format!("user:{}", user));
-        }
         if let Some(session_id) = ConsistentHeaderKeys::extract_field_value(text, "session_id") {
             return Some(format!("session:{}", session_id));
-        }
-        if let Some(user_id) = ConsistentHeaderKeys::extract_field_value(text, "user_id") {
-            return Some(format!("user:{}", user_id));
         }
 
         None
@@ -114,7 +110,12 @@ impl SicoStickyPolicy {
                 return state.scrape_token;
             }
         }
-        self.current_waiting(worker)
+        if let Ok(loads) = self.cached_loads.read() {
+            if loads.contains_key(worker.url()) {
+                return self.cached_load_generation.load(Ordering::Relaxed);
+            }
+        }
+        0
     }
 
     fn argmin_rr(scores: &[i64], start_idx: usize) -> usize {
@@ -327,6 +328,7 @@ impl LoadBalancingPolicy for SicoStickyPolicy {
     fn update_loads(&self, loads: &HashMap<String, isize>) {
         if let Ok(mut cached) = self.cached_loads.write() {
             *cached = loads.clone();
+            self.cached_load_generation.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -422,18 +424,18 @@ impl ConsistentHeaderKeys {
 
                     if let Some(stripped) = value_part.strip_prefix('"') {
                         if let Some(end_quote) = stripped.find('"') {
-                            return Some(stripped[..end_quote].to_string());
+                            return Self::non_empty_value(&stripped[..end_quote]);
                         }
                     } else if let Some(stripped) = value_part.strip_prefix('\'') {
                         if let Some(end_quote) = stripped.find('\'') {
-                            return Some(stripped[..end_quote].to_string());
+                            return Self::non_empty_value(&stripped[..end_quote]);
                         }
                     } else {
                         let end_pos = value_part
                             .find(&[',', ' ', '}', ']', '\n', '\r', '\t'][..])
                             .unwrap_or(value_part.len());
                         if end_pos > 0 {
-                            return Some(value_part[..end_pos].to_string());
+                            return Self::non_empty_value(&value_part[..end_pos]);
                         }
                     }
                 }
@@ -441,6 +443,14 @@ impl ConsistentHeaderKeys {
         }
 
         None
+    }
+
+    fn non_empty_value(value: &str) -> Option<String> {
+        if value.trim().is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
     }
 }
 
@@ -493,5 +503,65 @@ mod tests {
         let first = policy.select_worker_with_headers(&workers, Some("{}"), None).unwrap();
         let second = policy.select_worker_with_headers(&workers, Some("{}"), None).unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn openai_user_field_is_not_sticky_session() {
+        let policy = SicoStickyPolicy::new();
+        let workers = workers();
+        let body = r#"{"model":"test","messages":[],"user":"test"}"#;
+
+        assert_eq!(policy.extract_sticky_key(Some(body), None), None);
+
+        let first = policy
+            .select_worker_with_headers(&workers, Some(body), None)
+            .unwrap();
+        let second = policy
+            .select_worker_with_headers(&workers, Some(body), None)
+            .unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn empty_string_fields_are_not_sticky_sessions() {
+        let policy = SicoStickyPolicy::new();
+        let workers = workers();
+
+        for body in [
+            r#"{"user":""}"#,
+            r#"{"user_id":""}"#,
+            r#"{"session_id":""}"#,
+            r#"{"session_params":{"session_id":""}}"#,
+        ] {
+            assert_eq!(policy.extract_sticky_key(Some(body), None), None);
+        }
+
+        let first = policy
+            .select_worker_with_headers(&workers, Some(r#"{"user":""}"#), None)
+            .unwrap();
+        let second = policy
+            .select_worker_with_headers(&workers, Some(r#"{"user":""}"#), None)
+            .unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn explicit_body_session_id_remains_sticky() {
+        let policy = SicoStickyPolicy::new();
+        let workers = workers();
+        let body = r#"{"session_id":"session-1","user":"test"}"#;
+
+        assert_eq!(
+            policy.extract_sticky_key(Some(body), None),
+            Some("session:session-1".to_string())
+        );
+
+        let first = policy
+            .select_worker_with_headers(&workers, Some(body), None)
+            .unwrap();
+        let second = policy
+            .select_worker_with_headers(&workers, Some(body), None)
+            .unwrap();
+        assert_eq!(first, second);
     }
 }
