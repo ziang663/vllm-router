@@ -211,15 +211,20 @@ pub fn sync_stateful_policy_workers(
     if let Some(cache_aware_no_queue) = policy.as_any().downcast_ref::<CacheAwareNoQueuePolicy>() {
         cache_aware_no_queue.init_workers(workers);
     }
+    if let Some(sico_sticky) = policy.as_any().downcast_ref::<SicoStickyPolicy>() {
+        sico_sticky.init_workers(workers);
+    }
 }
 
 pub fn remove_worker_from_stateful_policy(policy: &Arc<dyn LoadBalancingPolicy>, url: &str) {
     if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
         cache_aware.remove_worker_by_url(url);
     }
-    if let Some(cache_aware_no_queue) = policy.as_any().downcast_ref::<CacheAwareNoQueuePolicy>()
-    {
+    if let Some(cache_aware_no_queue) = policy.as_any().downcast_ref::<CacheAwareNoQueuePolicy>() {
         cache_aware_no_queue.remove_worker_by_url(url);
+    }
+    if let Some(sico_sticky) = policy.as_any().downcast_ref::<SicoStickyPolicy>() {
+        sico_sticky.remove_worker_by_url(url);
     }
 }
 

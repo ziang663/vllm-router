@@ -2,20 +2,25 @@
 //!
 //! This policy ports the core behavior of Sico's `StickySessionLB` into the
 //! native router policy interface:
-//! - first placement picks the least-loaded worker with round-robin tie break
+//! - router-local load imbalance bypasses stickiness and picks the least-loaded worker
 //! - later requests for the same session stay sticky
+//! - new or missing sessions fall back to cache-aware prefix routing
 //! - migration only happens when the mapped worker is sufficiently worse than
 //!   the best worker and a global cooldown has elapsed
 //! - a small local waiting bump reduces stampedes between load refreshes
 
 use super::{
-    get_healthy_worker_indices, BackendObservedLoad, LoadBalancingPolicy, RequestHeaders,
+    get_healthy_worker_indices, normalize_model_key, BackendObservedLoad, CacheAwareConfig,
+    LoadBalancingPolicy, RequestHeaders,
 };
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
+use crate::tree::Tree;
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const STICKY_WAIT_WEIGHT: i64 = 4;
@@ -32,21 +37,151 @@ struct StickyState {
     last_migration_at: Option<Instant>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SicoStickyPolicy {
     state: Mutex<StickyState>,
+    cache_config: CacheAwareConfig,
+    trees: Arc<DashMap<String, Arc<Tree>>>,
     cached_loads: RwLock<HashMap<String, isize>>,
     cached_load_generation: AtomicI64,
     observed: RwLock<HashMap<String, BackendObservedLoad>>,
+    eviction_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl SicoStickyPolicy {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_cache_config(CacheAwareConfig {
+            cache_threshold: 0.3,
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 120,
+            max_tree_size: 1 << 26,
+        })
+    }
+
+    pub fn with_cache_config(cache_config: CacheAwareConfig) -> Self {
+        let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
+        let eviction_handle = if cache_config.eviction_interval_secs > 0 {
+            let trees_clone = Arc::clone(&trees);
+            let max_tree_size = cache_config.max_tree_size;
+            let interval = cache_config.eviction_interval_secs;
+
+            Some(thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(interval));
+                for entry in trees_clone.iter() {
+                    entry.value().evict_tenant_by_size(max_tree_size);
+                }
+            }))
+        } else {
+            None
+        };
+
+        Self {
+            state: Mutex::new(StickyState::default()),
+            cache_config,
+            trees,
+            cached_loads: RwLock::new(HashMap::new()),
+            cached_load_generation: AtomicI64::new(0),
+            observed: RwLock::new(HashMap::new()),
+            eviction_handle,
+        }
     }
 
     fn score(waiting: i64, running: i64) -> i64 {
         waiting.saturating_mul(STICKY_WAIT_WEIGHT) + running
+    }
+
+    fn get_or_init_tree(
+        &self,
+        model_id: &str,
+        candidates: &[(usize, Arc<dyn Worker>)],
+    ) -> Arc<Tree> {
+        let tree = self
+            .trees
+            .entry(model_id.to_string())
+            .or_insert_with(|| Arc::new(Tree::new()))
+            .clone();
+
+        for (_, worker) in candidates {
+            tree.insert("", worker.url());
+        }
+
+        tree
+    }
+
+    fn local_load_bounds(workers: &[Arc<dyn Worker>]) -> (usize, usize) {
+        let (min_load, max_load) =
+            workers
+                .iter()
+                .fold((usize::MAX, 0usize), |(min, max), worker| {
+                    let load = worker.load();
+                    (min.min(load), max.max(load))
+                });
+        let min_load = if min_load == usize::MAX { 0 } else { min_load };
+        (min_load, max_load)
+    }
+
+    fn is_router_load_imbalanced(&self, min_load: usize, max_load: usize) -> bool {
+        max_load.saturating_sub(min_load) > self.cache_config.balance_abs_threshold
+            && (max_load as f32) > (min_load as f32 * self.cache_config.balance_rel_threshold)
+    }
+
+    fn pick_min_router_load(candidates: &[(usize, Arc<dyn Worker>)]) -> Option<usize> {
+        candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, worker))| worker.load())
+            .map(|(idx, _)| idx)
+    }
+
+    fn pick_by_cache_aware(
+        &self,
+        candidates: &[(usize, Arc<dyn Worker>)],
+        request_text: Option<&str>,
+    ) -> Option<usize> {
+        let model_id = normalize_model_key(candidates[0].1.model_id());
+        let tree = self.get_or_init_tree(model_id, candidates);
+        let text = request_text.unwrap_or("");
+        let result = tree.prefix_match_with_counts(text);
+        let match_rate = if result.input_char_count == 0 {
+            0.0
+        } else {
+            result.matched_char_count as f32 / result.input_char_count as f32
+        };
+
+        let selected_idx = if match_rate > self.cache_config.cache_threshold {
+            let tenant_url: &str = &result.tenant;
+            candidates
+                .iter()
+                .position(|(_, worker)| worker.url() == tenant_url && worker.is_healthy())
+        } else {
+            Self::pick_min_router_load(candidates)
+        };
+
+        if let Some(idx) = selected_idx {
+            tree.insert(text, candidates[idx].1.url());
+            return Some(idx);
+        }
+
+        if match_rate > self.cache_config.cache_threshold {
+            tree.remove_tenant(&result.tenant);
+        }
+
+        Some(0)
+    }
+
+    fn bump_local_waiting(state: &mut StickyState, engine_id: &str) {
+        let entry = state
+            .local_counts
+            .entry(engine_id.to_string())
+            .or_insert((0, 0));
+        entry.0 += STICKY_CLIENT_COUNT;
+    }
+
+    pub fn remove_worker_by_url(&self, url: &str) {
+        for tree_ref in self.trees.iter() {
+            tree_ref.value().remove_tenant(url);
+        }
     }
 
     fn extract_sticky_key(
@@ -215,29 +350,6 @@ impl LoadBalancingPolicy for SicoStickyPolicy {
             state.start_idx = 0;
         }
 
-        let pick_by_local = |state: &mut StickyState| -> usize {
-            let scores: Vec<i64> = engine_ids
-                .iter()
-                .map(|engine_id| {
-                    let (waiting, running) =
-                        state.local_counts.get(engine_id).copied().unwrap_or((0, 0));
-                    Self::score(waiting, running)
-                })
-                .collect();
-
-            let chosen = Self::argmin_rr(&scores, state.start_idx);
-            state.start_idx = (chosen + 1) % engine_ids.len();
-
-            let chosen_engine = &engine_ids[chosen];
-            let entry = state
-                .local_counts
-                .entry(chosen_engine.clone())
-                .or_insert((0, 0));
-            entry.0 += STICKY_CLIENT_COUNT;
-
-            chosen
-        };
-
         let pick_by_observed = |state: &StickyState| -> usize {
             let scores: Vec<i64> = observed_waiting
                 .iter()
@@ -247,57 +359,77 @@ impl LoadBalancingPolicy for SicoStickyPolicy {
             Self::argmin_rr(&scores, state.start_idx)
         };
 
-        let (chosen_sorted_idx, migrated) = match session_id {
-            None => (pick_by_local(&mut state), false),
-            Some(session_id) => {
-                if let Some(mapped_engine) = state.session_map.get(&session_id).cloned() {
-                    if let Some(mapped_idx) = engine_ids.iter().position(|engine| engine == &mapped_engine)
-                    {
-                        let best_idx = pick_by_observed(&state);
-                        let mut chosen_idx = mapped_idx;
-                        let mut migrated = false;
+        let (min_load, max_load) = Self::local_load_bounds(workers);
+        let (chosen_sorted_idx, migrated) = if self.is_router_load_imbalanced(min_load, max_load) {
+            let chosen_idx = Self::pick_min_router_load(&candidates)?;
+            if let Some(text) = request_text {
+                let model_id = normalize_model_key(candidates[chosen_idx].1.model_id());
+                let tree = self.get_or_init_tree(model_id, &candidates);
+                tree.insert(text, candidates[chosen_idx].1.url());
+            }
+            Self::bump_local_waiting(&mut state, &engine_ids[chosen_idx]);
+            (chosen_idx, false)
+        } else {
+            match session_id {
+                None => {
+                    let chosen_idx = self.pick_by_cache_aware(&candidates, request_text)?;
+                    Self::bump_local_waiting(&mut state, &engine_ids[chosen_idx]);
+                    (chosen_idx, false)
+                }
+                Some(session_id) => {
+                    if let Some(mapped_engine) = state.session_map.get(&session_id).cloned() {
+                        if let Some(mapped_idx) = engine_ids
+                            .iter()
+                            .position(|engine| engine == &mapped_engine)
+                        {
+                            let best_idx = pick_by_observed(&state);
+                            let mut chosen_idx = mapped_idx;
+                            let mut migrated = false;
 
-                        if best_idx != mapped_idx {
-                            let mapped_score =
-                                Self::score(observed_waiting[mapped_idx], observed_running[mapped_idx]);
-                            let best_score =
-                                Self::score(observed_waiting[best_idx], observed_running[best_idx]);
-                            let migration_allowed = state
-                                .last_migration_at
-                                .map(|ts| ts.elapsed() >= STICKY_MIGRATE_COOLDOWN)
-                                .unwrap_or(true);
+                            if best_idx != mapped_idx {
+                                let mapped_score = Self::score(
+                                    observed_waiting[mapped_idx],
+                                    observed_running[mapped_idx],
+                                );
+                                let best_score = Self::score(
+                                    observed_waiting[best_idx],
+                                    observed_running[best_idx],
+                                );
+                                let migration_allowed = state
+                                    .last_migration_at
+                                    .map(|ts| ts.elapsed() >= STICKY_MIGRATE_COOLDOWN)
+                                    .unwrap_or(true);
 
-                            if mapped_score - best_score >= STICKY_SLACK && migration_allowed {
-                                chosen_idx = best_idx;
-                                state
-                                    .session_map
-                                    .insert(session_id.clone(), engine_ids[best_idx].clone());
-                                state.last_migration_at = Some(Instant::now());
-                                migrated = true;
+                                if mapped_score - best_score >= STICKY_SLACK && migration_allowed {
+                                    chosen_idx = best_idx;
+                                    state
+                                        .session_map
+                                        .insert(session_id.clone(), engine_ids[best_idx].clone());
+                                    state.last_migration_at = Some(Instant::now());
+                                    migrated = true;
+                                }
                             }
+
+                            let chosen_engine = &engine_ids[chosen_idx];
+                            Self::bump_local_waiting(&mut state, chosen_engine);
+
+                            (chosen_idx, migrated)
+                        } else {
+                            let chosen_idx = self.pick_by_cache_aware(&candidates, request_text)?;
+                            Self::bump_local_waiting(&mut state, &engine_ids[chosen_idx]);
+                            state
+                                .session_map
+                                .insert(session_id, engine_ids[chosen_idx].clone());
+                            (chosen_idx, false)
                         }
-
-                        let chosen_engine = &engine_ids[chosen_idx];
-                        let entry = state
-                            .local_counts
-                            .entry(chosen_engine.clone())
-                            .or_insert((0, 0));
-                        entry.0 += STICKY_CLIENT_COUNT;
-
-                        (chosen_idx, migrated)
                     } else {
-                        let chosen_idx = pick_by_local(&mut state);
+                        let chosen_idx = self.pick_by_cache_aware(&candidates, request_text)?;
+                        Self::bump_local_waiting(&mut state, &engine_ids[chosen_idx]);
                         state
                             .session_map
                             .insert(session_id, engine_ids[chosen_idx].clone());
                         (chosen_idx, false)
                     }
-                } else {
-                    let chosen_idx = pick_by_local(&mut state);
-                    state
-                        .session_map
-                        .insert(session_id, engine_ids[chosen_idx].clone());
-                    (chosen_idx, false)
                 }
             }
         };
@@ -340,6 +472,38 @@ impl LoadBalancingPolicy for SicoStickyPolicy {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn requires_initialization(&self) -> bool {
+        true
+    }
+
+    fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
+        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
+        for worker in workers {
+            let tree_key = normalize_model_key(worker.model_id());
+            model_workers
+                .entry(tree_key.to_string())
+                .or_default()
+                .push(worker);
+        }
+
+        for (tree_key, model_workers) in model_workers {
+            let tree = self
+                .trees
+                .entry(tree_key)
+                .or_insert_with(|| Arc::new(Tree::new()))
+                .clone();
+            for worker in model_workers {
+                tree.insert("", worker.url());
+            }
+        }
+    }
+}
+
+impl Drop for SicoStickyPolicy {
+    fn drop(&mut self) {
+        let _ = self.eviction_handle.take();
     }
 }
 
@@ -459,6 +623,16 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
 
+    fn policy() -> SicoStickyPolicy {
+        SicoStickyPolicy::with_cache_config(CacheAwareConfig {
+            cache_threshold: 0.3,
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 0,
+            max_tree_size: 1 << 26,
+        })
+    }
+
     fn workers() -> Vec<Arc<dyn Worker>> {
         vec![
             Arc::new(BasicWorker::new(
@@ -476,9 +650,27 @@ mod tests {
         ]
     }
 
+    fn add_load(worker: &Arc<dyn Worker>, count: usize) {
+        for _ in 0..count {
+            worker.increment_load();
+        }
+    }
+
+    fn remove_load(worker: &Arc<dyn Worker>, count: usize) {
+        for _ in 0..count {
+            worker.decrement_load();
+        }
+    }
+
+    fn headers(name: &str, value: &str) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        headers.insert(name.to_string(), value.to_string());
+        headers
+    }
+
     #[test]
     fn sticky_session_keeps_same_worker() {
-        let policy = SicoStickyPolicy::new();
+        let policy = policy();
         let workers = workers();
         let mut headers = HashMap::new();
         headers.insert("x-session-id".to_string(), "session-1".to_string());
@@ -496,18 +688,22 @@ mod tests {
     }
 
     #[test]
-    fn requests_without_session_rotate_by_load() {
-        let policy = SicoStickyPolicy::new();
+    fn requests_without_session_use_cache_aware_fallback() {
+        let policy = policy();
         let workers = workers();
 
-        let first = policy.select_worker_with_headers(&workers, Some("{}"), None).unwrap();
-        let second = policy.select_worker_with_headers(&workers, Some("{}"), None).unwrap();
-        assert_ne!(first, second);
+        let first = policy
+            .select_worker_with_headers(&workers, Some("{}"), None)
+            .unwrap();
+        let second = policy
+            .select_worker_with_headers(&workers, Some("{}"), None)
+            .unwrap();
+        assert_eq!(first, second);
     }
 
     #[test]
     fn openai_user_field_is_not_sticky_session() {
-        let policy = SicoStickyPolicy::new();
+        let policy = policy();
         let workers = workers();
         let body = r#"{"model":"test","messages":[],"user":"test"}"#;
 
@@ -519,12 +715,12 @@ mod tests {
         let second = policy
             .select_worker_with_headers(&workers, Some(body), None)
             .unwrap();
-        assert_ne!(first, second);
+        assert_eq!(first, second);
     }
 
     #[test]
     fn empty_string_fields_are_not_sticky_sessions() {
-        let policy = SicoStickyPolicy::new();
+        let policy = policy();
         let workers = workers();
 
         for body in [
@@ -542,12 +738,12 @@ mod tests {
         let second = policy
             .select_worker_with_headers(&workers, Some(r#"{"user":""}"#), None)
             .unwrap();
-        assert_ne!(first, second);
+        assert_eq!(first, second);
     }
 
     #[test]
     fn explicit_body_session_id_remains_sticky() {
-        let policy = SicoStickyPolicy::new();
+        let policy = policy();
         let workers = workers();
         let body = r#"{"session_id":"session-1","user":"test"}"#;
 
@@ -563,5 +759,186 @@ mod tests {
             .select_worker_with_headers(&workers, Some(body), None)
             .unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn unmatched_session_falls_back_to_cache_aware_and_then_sticks() {
+        let policy = policy();
+        let workers = workers();
+        let text = r#"{"prompt":"shared-prefix-for-cache"}"#;
+
+        // Make the cache owner non-trivial: with w1 and w3 busier, the seed
+        // request chooses w2. Then make w2 busier than w1/w3 so a later choice
+        // can only pick w2 because of the prefix cache hit, not min-load.
+        add_load(&workers[1], 10);
+        add_load(&workers[2], 10);
+        let cached_worker = policy
+            .select_worker_with_headers(&workers, Some(text), None)
+            .unwrap();
+        assert_eq!(workers[cached_worker].url(), "http://w2:8000");
+
+        add_load(&workers[cached_worker], 20);
+
+        let body = r#"{"prompt":"shared-prefix-for-cache","session_id":"new-session"}"#;
+        let first_session_worker = policy
+            .select_worker_with_headers(&workers, Some(body), None)
+            .unwrap();
+        assert_eq!(first_session_worker, cached_worker);
+
+        let second_session_worker = policy
+            .select_worker_with_headers(
+                &workers,
+                Some(r#"{"session_id":"new-session","prompt":"different"}"#),
+                None,
+            )
+            .unwrap();
+        assert_eq!(second_session_worker, first_session_worker);
+    }
+
+    #[test]
+    fn local_load_imbalance_bypasses_existing_sticky_session() {
+        let policy = policy();
+        let workers = workers();
+        let body = r#"{"session_id":"session-1","prompt":"a"}"#;
+
+        let sticky_worker = policy
+            .select_worker_with_headers(&workers, Some(body), None)
+            .unwrap();
+        for _ in 0..65 {
+            workers[sticky_worker].increment_load();
+        }
+
+        let chosen = policy
+            .select_worker_with_headers(&workers, Some(body), None)
+            .unwrap();
+        assert_ne!(chosen, sticky_worker);
+        assert_eq!(workers[chosen].load(), 0);
+    }
+
+    #[test]
+    fn different_header_sessions_with_same_prompt_share_cache_owner() {
+        let policy = policy();
+        let workers = workers();
+        let text = r#"{"prompt":"same-prefix-from-two-header-sessions"}"#;
+
+        add_load(&workers[1], 10);
+        add_load(&workers[2], 10);
+        let session_a = headers("x-session-id", "session-a");
+        let first = policy
+            .select_worker_with_headers(&workers, Some(text), Some(&session_a))
+            .unwrap();
+        assert_eq!(workers[first].url(), "http://w2:8000");
+
+        add_load(&workers[first], 20);
+        let session_b = headers("x-session-id", "session-b");
+        let second = policy
+            .select_worker_with_headers(&workers, Some(text), Some(&session_b))
+            .unwrap();
+        assert_eq!(second, first);
+
+        let second_sticky = policy
+            .select_worker_with_headers(
+                &workers,
+                Some(r#"{"prompt":"different-text-after-session-b-is-bound"}"#),
+                Some(&session_b),
+            )
+            .unwrap();
+        assert_eq!(second_sticky, second);
+    }
+
+    #[test]
+    fn different_body_sessions_share_cache_when_common_prompt_prefix_is_first() {
+        let policy = policy();
+        let workers = workers();
+        let body_a = r#"{"prompt":"very-long-common-prefix-for-body-session-cache-aware-routing","session_id":"body-a"}"#;
+        let body_b = r#"{"prompt":"very-long-common-prefix-for-body-session-cache-aware-routing","session_id":"body-b"}"#;
+
+        add_load(&workers[1], 10);
+        add_load(&workers[2], 10);
+        let first = policy
+            .select_worker_with_headers(&workers, Some(body_a), None)
+            .unwrap();
+        assert_eq!(workers[first].url(), "http://w2:8000");
+
+        add_load(&workers[first], 20);
+        let second = policy
+            .select_worker_with_headers(&workers, Some(body_b), None)
+            .unwrap();
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn load_imbalance_takes_precedence_over_cache_hit_for_unkeyed_request() {
+        let policy = policy();
+        let workers = workers();
+        let text = r#"{"prompt":"cache-hit-but-overloaded"}"#;
+
+        let cached_worker = policy
+            .select_worker_with_headers(&workers, Some(text), None)
+            .unwrap();
+        add_load(&workers[cached_worker], 65);
+
+        let chosen = policy
+            .select_worker_with_headers(&workers, Some(text), None)
+            .unwrap();
+        assert_ne!(chosen, cached_worker);
+        assert_eq!(workers[chosen].load(), 0);
+    }
+
+    #[test]
+    fn sticky_mapping_survives_temporary_router_load_imbalance() {
+        let policy = policy();
+        let workers = workers();
+        let headers = headers("x-session-id", "stable-session");
+        let body = r#"{"prompt":"stable"}"#;
+
+        let sticky_worker = policy
+            .select_worker_with_headers(&workers, Some(body), Some(&headers))
+            .unwrap();
+        add_load(&workers[sticky_worker], 65);
+
+        let overloaded_choice = policy
+            .select_worker_with_headers(&workers, Some(body), Some(&headers))
+            .unwrap();
+        assert_ne!(overloaded_choice, sticky_worker);
+
+        remove_load(&workers[sticky_worker], 65);
+        let restored_choice = policy
+            .select_worker_with_headers(&workers, Some(body), Some(&headers))
+            .unwrap();
+        assert_eq!(restored_choice, sticky_worker);
+    }
+
+    #[test]
+    fn backend_observed_load_can_still_migrate_existing_sticky_session_when_balanced() {
+        let policy = policy();
+        let workers = workers();
+        let headers = headers("x-session-id", "migrating-session");
+        let body = r#"{"prompt":"migrate"}"#;
+
+        let sticky_worker = policy
+            .select_worker_with_headers(&workers, Some(body), Some(&headers))
+            .unwrap();
+        let sticky_url = workers[sticky_worker].url().to_string();
+
+        let mut observations = HashMap::new();
+        for worker in &workers {
+            let waiting = if worker.url() == sticky_url { 100 } else { 0 };
+            observations.insert(
+                worker.url().to_string(),
+                BackendObservedLoad {
+                    waiting,
+                    running: 0,
+                    scrape_token: 1,
+                },
+            );
+        }
+        policy.update_backend_observations(&observations);
+
+        let migrated = policy
+            .select_worker_with_headers(&workers, Some(body), Some(&headers))
+            .unwrap();
+        assert_ne!(migrated, sticky_worker);
+        assert_eq!(workers[migrated].load(), 0);
     }
 }
